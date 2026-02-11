@@ -36,8 +36,8 @@ else if (process.env.HOME || process.env.HOMEPATH)
   PM2_ROOT_PATH = path.resolve(process.env.HOMEDRIVE, process.env.HOME || process.env.HOMEPATH, '.pm2');
 
 const parseBool = (str, defaultVal = false) => {
-  if (str === 'true') return true;
-  if (str === 'false') return false;
+  if (str === true || str === 'true') return true;
+  if (str === false || str === 'false') return false;
   return defaultVal;
 };
 
@@ -51,6 +51,11 @@ var DATE_FORMAT = conf.dateFormat || 'YYYY-MM-DD_HH-mm-ss';
 var TZ = conf.TZ;
 var ROTATE_MODULE = parseBool(conf.rotateModule, true);
 var WATCHED_FILES = [];
+
+// NEW: rsyslog compatibility mode - uses copytruncate instead of pipe
+var RSYSLOG_COMPAT = parseBool(conf.rsyslogCompat, false);
+// NEW: delay after truncate to minimize log loss (milliseconds)
+var TRUNCATE_DELAY = isNaN(parseInt(conf.truncateDelay)) ? 100 : parseInt(conf.truncateDelay);
 
 function get_limit_size() {
   if (conf.max_size === '')
@@ -95,11 +100,114 @@ function delete_old(file) {
 
 
 /**
- * Apply the rotation process of the log file.
+ * Apply the rotation process of the log file using copytruncate method.
+ * This is rsyslog-compatible and avoids file descriptor issues.
  *
  * @param {string} file 
  */
-function proceed(file) {
+function proceed_copytruncate(file) {
+  // set default final time
+  var final_time = moment().format(DATE_FORMAT);
+  // check for a timezone
+  if (TZ) {
+    try {
+      final_time = moment().tz(TZ).format(DATE_FORMAT);
+    } catch(err) {
+      // use default
+    }
+  }
+  var final_name = file.substr(0, file.length - 4) + '__' + final_time + '.log';
+  
+  // Step 1: Copy the file
+  var copy_complete = false;
+  var temp_file = final_name + '.tmp';
+  
+  if (COMPRESSION) {
+    // Compress while copying
+    final_name += ".gz";
+    var GZIP = zlib.createGzip({ level: zlib.Z_BEST_COMPRESSION, memLevel: zlib.Z_BEST_COMPRESSION });
+    var readStream = fs.createReadStream(file);
+    var writeStream = fs.createWriteStream(temp_file, {'flags': 'w+'});
+    
+    readStream.pipe(GZIP).pipe(writeStream);
+    
+    readStream.on('error', function(err) {
+      pmx.notify(err);
+      cleanup_temp();
+    });
+    
+    writeStream.on('error', function(err) {
+      pmx.notify(err);
+      cleanup_temp();
+    });
+    
+    GZIP.on('error', function(err) {
+      pmx.notify(err);
+      cleanup_temp();
+    });
+    
+    writeStream.on('finish', function() {
+      GZIP.close();
+      readStream.close();
+      writeStream.close();
+      copy_complete = true;
+      finalize_rotation();
+    });
+  } else {
+    // Simple file copy
+    fs.copyFile(file, temp_file, function(err) {
+      if (err) {
+        pmx.notify(err);
+        cleanup_temp();
+        return;
+      }
+      copy_complete = true;
+      finalize_rotation();
+    });
+  }
+  
+  function cleanup_temp() {
+    fs.unlink(temp_file, function() {});
+  }
+  
+  function finalize_rotation() {
+    if (!copy_complete) return;
+    
+    // Step 2: Rename temp file to final name
+    fs.rename(temp_file, final_name, function(err) {
+      if (err) {
+        pmx.notify(err);
+        cleanup_temp();
+        return;
+      }
+      
+      // Step 3: Truncate original file after a small delay
+      // This minimizes (but doesn't eliminate) log loss during rotation
+      setTimeout(function() {
+        fs.truncate(file, 0, function (err) {
+          if (err) {
+            pmx.notify(err);
+            return;
+          }
+          
+          console.log('"' + final_name + '" has been created (copytruncate mode)');
+          
+          if (typeof(RETAIN) === 'number') 
+            delete_old(file);
+        });
+      }, TRUNCATE_DELAY);
+    });
+  }
+}
+
+
+/**
+ * Apply the rotation process of the log file using traditional method.
+ * This is the original implementation.
+ *
+ * @param {string} file 
+ */
+function proceed_traditional(file) {
   // set default final time
   var final_time = moment().format(DATE_FORMAT);
   // check for a timezone
@@ -142,7 +250,7 @@ function proceed(file) {
     }
     readStream.close();
     writeStream.close();
-    fs.truncate(file, function (err) {
+    fs.truncate(file, function (err) {
       if (err) return pmx.notify(err);
       console.log('"' + final_name + '" has been created');
 
@@ -150,6 +258,21 @@ function proceed(file) {
         delete_old(file);
     });
   });
+}
+
+
+/**
+ * Apply the rotation process of the log file.
+ * Uses copytruncate method if rsyslogCompat is enabled, otherwise uses traditional method.
+ *
+ * @param {string} file 
+ */
+function proceed(file) {
+  if (RSYSLOG_COMPAT) {
+    proceed_copytruncate(file);
+  } else {
+    proceed_traditional(file);
+  }
 }
 
 
@@ -198,6 +321,8 @@ function proceed_app(app, force) {
 // Connect to local PM2
 pm2.connect(function(err) {
   if (err) return console.error(err.stack || err);
+
+  console.log('pm2-logrotate started with rsyslog compatibility:', RSYSLOG_COMPAT);
 
   // start background task
   setInterval(function() {
